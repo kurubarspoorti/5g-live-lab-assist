@@ -7,6 +7,18 @@ const RTC_CONFIG = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
 
+function toWorkspaceSnapshot(snapshot) {
+  return {
+    id: snapshot.id,
+    image: snapshot.data?.image || "",
+    width: snapshot.metadata?.width || 0,
+    height: snapshot.metadata?.height || 0,
+    createdAt:
+      snapshot.metadata?.createdAt || snapshot.createdAt || "",
+    version: snapshot.version,
+  };
+}
+
 export default function App() {
   const [role, setRole] = useState("professor");
   const [sessionCode, setSessionCode] = useState("");
@@ -21,7 +33,6 @@ export default function App() {
   const [remoteStream, setRemoteStream] = useState(null);
   const [cameraError, setCameraError] = useState("");
 
-  // Shared annotation and ROI snapshot state
   const [isDrawing, setIsDrawing] = useState(false);
   const [annotations, setAnnotations] = useState([]);
   const [selectedColor, setSelectedColor] = useState("#ff3333");
@@ -46,24 +57,32 @@ export default function App() {
 
     newSocket.on("connect", () => setConnection("Connected"));
     newSocket.on("disconnect", () => setConnection("Disconnected"));
-    newSocket.on("connect_error", () => setConnection("Connection failed"));
+    newSocket.on("connect_error", () =>
+      setConnection("Connection failed")
+    );
 
     newSocket.on("session-joined", (data) => {
       setParticipants(data.participants || []);
       setActiveSession(data.code);
+      setSnapshots((data.snapshots || []).map(toWorkspaceSnapshot));
+      newSocket.emit("snapshot:history:request");
       setMessage(`Joined session ${data.code} as ${data.role}.`);
     });
 
     newSocket.on("participant-joined", (participant) => {
       setParticipants((previous) => {
-        if (previous.some((p) => p.socketId === participant.socketId)) return previous;
+        if (previous.some((p) => p.socketId === participant.socketId)) {
+          return previous;
+        }
         return [...previous, participant];
       });
       setMessage(`${participant.role} joined your session.`);
     });
 
     newSocket.on("participant-left", ({ socketId }) => {
-      setParticipants((previous) => previous.filter((p) => p.socketId !== socketId));
+      setParticipants((previous) =>
+        previous.filter((p) => p.socketId !== socketId)
+      );
       setMessage("A participant left the session.");
     });
 
@@ -71,23 +90,99 @@ export default function App() {
       setMessage(data.message || "Could not join the session.");
     });
 
-    newSocket.on("annotation-update", ({ annotation } = {}) => {
-      if (annotation) setAnnotations((previous) => [...previous, annotation]);
+    // A snapshot created by either participant is shared with the room.
+    newSocket.on("snapshot:created", ({ snapshot } = {}) => {
+      if (!snapshot) return;
+
+      setSnapshots((previous) => {
+        if (previous.some((item) => item.id === snapshot.id)) {
+          return previous;
+        }
+        return [toWorkspaceSnapshot(snapshot), ...previous];
+      });
     });
+
+    newSocket.on("snapshot:updated", ({ snapshot } = {}) => {
+      if (!snapshot) return;
+
+      setSnapshots((previous) =>
+        previous.map((item) =>
+          item.id === snapshot.id ? toWorkspaceSnapshot(snapshot) : item
+        )
+      );
+    });
+
+    newSocket.on("snapshot:deleted", ({ snapshotId } = {}) => {
+      if (!snapshotId) return;
+
+      setSnapshots((previous) =>
+        previous.filter((item) => item.id !== snapshotId)
+      );
+    });
+
+    // Rebuild the visible snapshot list from the session's history.
+    newSocket.on("snapshot:history", ({ history } = {}) => {
+      const snapshotsById = new Map();
+      const orderedHistory = [...(history || [])].sort(
+        (a, b) => (a.sequence || 0) - (b.sequence || 0)
+      );
+
+      orderedHistory.forEach((entry) => {
+        if (!entry?.snapshotId) return;
+
+        if (entry.action === "deleted") {
+          snapshotsById.delete(entry.snapshotId);
+        } else if (entry.snapshot) {
+          snapshotsById.set(entry.snapshotId, entry.snapshot);
+        }
+      });
+
+      setSnapshots(
+        Array.from(snapshotsById.values())
+          .reverse()
+          .map(toWorkspaceSnapshot)
+      );
+
+      console.log("Snapshot history received:", history || []);
+    });
+
+    newSocket.on("snapshot:error", ({ message: errorMessage } = {}) => {
+      setMessage(errorMessage || "Snapshot operation failed.");
+    });
+
+    newSocket.on(
+      "snapshot:conflict",
+      ({ message: conflictMessage } = {}) => {
+        setMessage(conflictMessage || "This snapshot changed elsewhere.");
+      }
+    );
+
+    // Shared annotation events.
+    newSocket.on("annotation-update", ({ annotation } = {}) => {
+      if (annotation) {
+        setAnnotations((previous) => [...previous, annotation]);
+      }
+    });
+
     newSocket.on("annotation-clear", () => setAnnotations([]));
 
     // Professor receives the student's WebRTC offer.
     newSocket.on("webrtc-offer", async ({ offer } = {}) => {
       try {
         if (!offer) return;
+
         peerRef.current?.close();
+
         const pc = new RTCPeerConnection(RTC_CONFIG);
         peerRef.current = pc;
         configurePeer(pc, newSocket);
+
         await pc.setRemoteDescription(offer);
         await flushCandidates(pc);
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
+
         newSocket.emit("webrtc-answer", { answer: pc.localDescription });
       } catch (error) {
         console.error("Could not handle WebRTC offer:", error);
@@ -100,6 +195,7 @@ export default function App() {
       try {
         const pc = peerRef.current;
         if (!pc || !answer) return;
+
         await pc.setRemoteDescription(answer);
         await flushCandidates(pc);
       } catch (error) {
@@ -109,11 +205,13 @@ export default function App() {
 
     newSocket.on("webrtc-ice-candidate", async ({ candidate } = {}) => {
       if (!candidate) return;
+
       const pc = peerRef.current;
       if (!pc || !pc.remoteDescription) {
         pendingCandidatesRef.current.push(candidate);
         return;
       }
+
       try {
         await pc.addIceCandidate(candidate);
       } catch (error) {
@@ -134,7 +232,9 @@ export default function App() {
   function configurePeer(pc, activeSocket) {
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        activeSocket.emit("webrtc-ice-candidate", { candidate: event.candidate });
+        activeSocket.emit("webrtc-ice-candidate", {
+          candidate: event.candidate,
+        });
       }
     };
 
@@ -146,13 +246,16 @@ export default function App() {
       if (pc.connectionState === "connected") {
         setMessage("Live video connection established!");
       } else if (pc.connectionState === "failed") {
-        setMessage("Video connection failed. Network or TURN configuration may be needed.");
+        setMessage(
+          "Video connection failed. Network or TURN configuration may be needed."
+        );
       }
     };
   }
 
   async function flushCandidates(pc) {
     const candidates = pendingCandidatesRef.current.splice(0);
+
     for (const candidate of candidates) {
       try {
         await pc.addIceCandidate(candidate);
@@ -164,23 +267,38 @@ export default function App() {
 
   // Student starts the video call after joining and enabling the camera.
   useEffect(() => {
-    if (role !== "student" || !activeSession || !localStream || !socket?.connected) return;
+    if (
+      role !== "student" ||
+      !activeSession ||
+      !localStream ||
+      !socket?.connected
+    ) {
+      return;
+    }
+
     let cancelled = false;
 
     async function startCall() {
       try {
         peerRef.current?.close();
         pendingCandidatesRef.current = [];
+
         const pc = new RTCPeerConnection(RTC_CONFIG);
         peerRef.current = pc;
         configurePeer(pc, socket);
-        localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+
+        localStream.getTracks().forEach((track) => {
+          pc.addTrack(track, localStream);
+        });
+
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
+
         if (cancelled) {
           pc.close();
           return;
         }
+
         socket.emit("webrtc-offer", { offer: pc.localDescription });
         setMessage("Calling the professor...");
       } catch (error) {
@@ -190,6 +308,7 @@ export default function App() {
     }
 
     startCall();
+
     return () => {
       cancelled = true;
     };
@@ -200,8 +319,12 @@ export default function App() {
   // --------------------------------------------------
   async function startCamera() {
     setCameraError("");
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
       setLocalStream(stream);
     } catch (error) {
       setCameraError(
@@ -226,8 +349,10 @@ export default function App() {
   function getCanvasPoint(event) {
     const canvas = canvasRef.current;
     if (!canvas) return null;
+
     const rect = canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
+
     return {
       x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
       y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
@@ -239,13 +364,17 @@ export default function App() {
       startRegionSelection(event);
       return;
     }
+
     if (!isDrawing || role !== "professor") return;
+
     const canvas = canvasRef.current;
     const point = getCanvasPoint(event);
     if (!canvas || !point) return;
+
     drawingRef.current = true;
     lastPointRef.current = point;
     canvas.setPointerCapture(event.pointerId);
+
     const annotation = { from: point, to: point, color: selectedColor };
     setAnnotations((previous) => [...previous, annotation]);
     socket?.emit("annotation-update", { annotation });
@@ -256,14 +385,18 @@ export default function App() {
       updateRegionSelection(event);
       return;
     }
+
     if (!drawingRef.current || role !== "professor") return;
+
     const point = getCanvasPoint(event);
     if (!point) return;
+
     const annotation = {
       from: lastPointRef.current,
       to: point,
       color: selectedColor,
     };
+
     lastPointRef.current = point;
     setAnnotations((previous) => [...previous, annotation]);
     socket?.emit("annotation-update", { annotation });
@@ -275,14 +408,17 @@ export default function App() {
       selectionStartRef.current = null;
       return;
     }
+
     drawingRef.current = false;
     lastPointRef.current = null;
   }
 
   function startRegionSelection(event) {
     if (role !== "professor" || !isCapturing || !remoteStream) return;
+
     const point = getCanvasPoint(event);
     if (!point) return;
+
     selectionStartRef.current = point;
     setSelectionRect({ x: point.x, y: point.y, width: 0, height: 0 });
     canvasRef.current?.setPointerCapture(event.pointerId);
@@ -292,6 +428,7 @@ export default function App() {
     const start = selectionStartRef.current;
     const point = getCanvasPoint(event);
     if (!start || !point) return;
+
     setSelectionRect({
       x: Math.min(start.x, point.x),
       y: Math.min(start.y, point.y),
@@ -305,12 +442,15 @@ export default function App() {
       setMessage("Wait for the student's live video before capturing a region.");
       return;
     }
+
     setIsDrawing(false);
     drawingRef.current = false;
     setSelectionRect(null);
     selectionStartRef.current = null;
     setIsCapturing(true);
-    setMessage("Drag over the live video to select a region, then click Save snapshot.");
+    setMessage(
+      "Drag over the live video to select a region, then click Save snapshot."
+    );
   }
 
   function cancelCaptureMode() {
@@ -323,25 +463,37 @@ export default function App() {
   function saveSnapshot() {
     const video = videoRef.current;
     const stage = canvasRef.current;
+
     if (!video || !stage || !selectionRect || video.readyState < 2) {
       setMessage("Select a region on the live video before saving.");
       return;
     }
+
     if (selectionRect.width < 0.01 || selectionRect.height < 0.01) {
       setMessage("The selected region is too small. Drag a larger rectangle.");
       return;
     }
 
-    // Convert the selected display rectangle to source-video pixels. This
-    // accounts for object-fit: cover, including any cropped edges.
+    if (!socket?.connected || !activeSession) {
+      setMessage("Join a session before saving a snapshot.");
+      return;
+    }
+
+    // Convert the selected display rectangle to source-video pixels.
+    // This accounts for object-fit: cover, including any cropped edges.
     const stageRect = stage.getBoundingClientRect();
     const videoWidth = video.videoWidth;
     const videoHeight = video.videoHeight;
+
     if (!videoWidth || !videoHeight || !stageRect.width || !stageRect.height) {
       setMessage("The video is not ready to capture yet.");
       return;
     }
-    const scale = Math.max(stageRect.width / videoWidth, stageRect.height / videoHeight);
+
+    const scale = Math.max(
+      stageRect.width / videoWidth,
+      stageRect.height / videoHeight
+    );
     const renderedWidth = videoWidth * scale;
     const renderedHeight = videoHeight * scale;
     const offsetX = (renderedWidth - stageRect.width) / 2;
@@ -351,42 +503,68 @@ export default function App() {
     let sy = (selectionRect.y * stageRect.height + offsetY) / scale;
     let sw = (selectionRect.width * stageRect.width) / scale;
     let sh = (selectionRect.height * stageRect.height) / scale;
+
     sx = Math.max(0, Math.min(videoWidth, sx));
     sy = Math.max(0, Math.min(videoHeight, sy));
     sw = Math.min(sw, videoWidth - sx);
     sh = Math.min(sh, videoHeight - sy);
+
     const cropWidth = Math.floor(sw);
     const cropHeight = Math.floor(sh);
+
     if (cropWidth < 2 || cropHeight < 2) {
-      setMessage("The selected region is outside the visible video. Please select again.");
+      setMessage(
+        "The selected region is outside the visible video. Please select again."
+      );
       return;
     }
 
     const output = document.createElement("canvas");
     output.width = cropWidth;
     output.height = cropHeight;
+
     const context = output.getContext("2d");
     if (!context) {
       setMessage("Could not create the snapshot. Please try again.");
       return;
     }
-    context.drawImage(video, sx, sy, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
-    const snapshot = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      image: output.toDataURL("image/png"),
-      createdAt: new Date().toLocaleTimeString(),
-      width: cropWidth,
-      height: cropHeight,
-    };
-    setSnapshots((previous) => [snapshot, ...previous]);
+
+    context.drawImage(
+      video,
+      sx,
+      sy,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      cropWidth,
+      cropHeight
+    );
+
+    const image = output.toDataURL("image/png");
+
+    socket.emit("snapshot:create", {
+      data: { image },
+      metadata: {
+        width: cropWidth,
+        height: cropHeight,
+        createdAt: new Date().toLocaleTimeString(),
+      },
+    });
+
     setIsCapturing(false);
     setSelectionRect(null);
     selectionStartRef.current = null;
-    setMessage("Region captured and added to your workspace.");
+    setMessage("Snapshot sent to the shared workspace.");
   }
 
   function deleteSnapshot(snapshotId) {
-    setSnapshots((previous) => previous.filter((item) => item.id !== snapshotId));
+    if (!socket?.connected || !activeSession) {
+      setMessage("Join a session before removing a snapshot.");
+      return;
+    }
+
+    socket.emit("snapshot:delete", { snapshotId });
   }
 
   function clearAnnotations() {
@@ -400,23 +578,34 @@ export default function App() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
     const rect = canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
+
     const pixelRatio = window.devicePixelRatio || 1;
     canvas.width = rect.width * pixelRatio;
     canvas.height = rect.height * pixelRatio;
+
     const context = canvas.getContext("2d");
     if (!context) return;
+
     context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
     context.clearRect(0, 0, rect.width, rect.height);
     context.lineWidth = 3;
     context.lineCap = "round";
     context.lineJoin = "round";
+
     annotations.forEach((annotation) => {
       context.beginPath();
       context.strokeStyle = annotation.color;
-      context.moveTo(annotation.from.x * rect.width, annotation.from.y * rect.height);
-      context.lineTo(annotation.to.x * rect.width, annotation.to.y * rect.height);
+      context.moveTo(
+        annotation.from.x * rect.width,
+        annotation.from.y * rect.height
+      );
+      context.lineTo(
+        annotation.to.x * rect.width,
+        annotation.to.y * rect.height
+      );
       context.stroke();
     });
   }, [annotations, role, remoteStream, localStream]);
@@ -430,12 +619,23 @@ export default function App() {
     setParticipants([]);
     setActiveSession("");
     setAnnotations([]);
+    setSnapshots([]);
+
     try {
-      const response = await fetch(`${SERVER_URL}/api/sessions`, { method: "POST" });
+      const response = await fetch(`${SERVER_URL}/api/sessions`, {
+        method: "POST",
+      });
       const data = await response.json();
-      if (!response.ok || !data.success) throw new Error(data.message || "Could not create session.");
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Could not create session.");
+      }
+
       setSessionCode(data.session.code);
-      socket.emit("join-session", { code: data.session.code, role: "professor" });
+      socket.emit("join-session", {
+        code: data.session.code,
+        role: "professor",
+      });
       setMessage("Session created. Joining its room...");
     } catch (error) {
       setMessage(error.message || "Could not connect to the backend.");
@@ -451,6 +651,8 @@ export default function App() {
     setParticipants([]);
     setActiveSession("");
     setAnnotations([]);
+    setSnapshots([]);
+
     try {
       const code = sessionCode.trim().toUpperCase();
       const response = await fetch(`${SERVER_URL}/api/sessions/join`, {
@@ -459,8 +661,15 @@ export default function App() {
         body: JSON.stringify({ code }),
       });
       const data = await response.json();
-      if (!response.ok || !data.success) throw new Error(data.message || "Could not join the session.");
-      socket.emit("join-session", { code: data.session.code, role: "student" });
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Could not join the session.");
+      }
+
+      socket.emit("join-session", {
+        code: data.session.code,
+        role: "student",
+      });
     } catch (error) {
       setMessage(error.message || "Could not connect to the backend.");
     } finally {
@@ -473,11 +682,13 @@ export default function App() {
     setActiveSession("");
     setParticipants([]);
     setAnnotations([]);
+    setSnapshots([]);
     setIsDrawing(false);
     setIsCapturing(false);
     setSelectionRect(null);
     selectionStartRef.current = null;
     setMessage("");
+
     peerRef.current?.close();
     peerRef.current = null;
     setRemoteStream(null);
@@ -488,6 +699,7 @@ export default function App() {
   // --------------------------------------------------
   function renderVideo() {
     const stream = role === "student" ? localStream : remoteStream;
+
     return (
       <div className="video-stage">
         {stream ? (
@@ -497,7 +709,9 @@ export default function App() {
             muted={role === "student"}
             ref={(element) => {
               videoRef.current = element;
-              if (element && element.srcObject !== stream) element.srcObject = stream;
+              if (element && element.srcObject !== stream) {
+                element.srcObject = stream;
+              }
             }}
           />
         ) : (
@@ -507,6 +721,7 @@ export default function App() {
               : "Student video will appear here after the WebRTC connection."}
           </div>
         )}
+
         <canvas
           ref={canvasRef}
           className="annotation-canvas"
@@ -516,10 +731,18 @@ export default function App() {
           onPointerCancel={stopDrawing}
           onLostPointerCapture={stopDrawing}
           style={{
-            pointerEvents: role === "professor" && (isDrawing || isCapturing) ? "auto" : "none",
-            cursor: isCapturing ? "crosshair" : isDrawing ? "crosshair" : "default",
+            pointerEvents:
+              role === "professor" && (isDrawing || isCapturing)
+                ? "auto"
+                : "none",
+            cursor: isCapturing
+              ? "crosshair"
+              : isDrawing
+                ? "crosshair"
+                : "default",
           }}
         />
+
         {selectionRect && (
           <div
             className="roi-selection"
@@ -546,7 +769,9 @@ export default function App() {
           <h1>Live Lab Assist</h1>
           <p>Real-time remote laboratory collaboration</p>
         </div>
-        <span className={`status ${connection === "Connected" ? "online" : ""}`}>
+        <span
+          className={`status ${connection === "Connected" ? "online" : ""}`}
+        >
           <span className="status-dot" />
           {connection}
         </span>
@@ -555,12 +780,16 @@ export default function App() {
       <section className="hero">
         <p className="eyebrow">REMOTE LABORATORY</p>
         <h2>Learn, guide, and solve together.</h2>
-        <p>Connect a student's live lab view with a professor's guidance and a shared workspace.</p>
+        <p>
+          Connect a student's live lab view with a professor's guidance and a
+          shared workspace.
+        </p>
       </section>
 
       <section className="panel">
         <h2>Get started</h2>
         <p className="muted">Choose how you want to use the lab.</p>
+
         <div className="role-picker">
           <button
             type="button"
@@ -571,6 +800,7 @@ export default function App() {
             <strong>Professor</strong>
             <span>Create a new session</span>
           </button>
+
           <button
             type="button"
             className={role === "student" ? "role selected" : "role"}
@@ -584,7 +814,11 @@ export default function App() {
 
         {role === "professor" ? (
           <div className="action-area">
-            <button className="primary-button" onClick={createSession} disabled={loading || !socket?.connected}>
+            <button
+              className="primary-button"
+              onClick={createSession}
+              disabled={loading || !socket?.connected}
+            >
               {loading ? "Creating..." : "Create session"}
             </button>
           </div>
@@ -594,36 +828,53 @@ export default function App() {
             <input
               id="sessionCode"
               value={sessionCode}
-              onChange={(event) => setSessionCode(event.target.value.toUpperCase())}
+              onChange={(event) =>
+                setSessionCode(event.target.value.toUpperCase())
+              }
               placeholder="Enter the professor's code"
               maxLength={6}
               required
             />
-            <button className="primary-button" type="submit" disabled={loading || !socket?.connected}>
+            <button
+              className="primary-button"
+              type="submit"
+              disabled={loading || !socket?.connected}
+            >
               {loading ? "Joining..." : "Join session"}
             </button>
           </form>
         )}
 
-        {message && <p className="message" role="status">{message}</p>}
+        {message && (
+          <p className="message" role="status">
+            {message}
+          </p>
+        )}
 
         {activeSession && (
           <div className="session-card">
             <span className="muted">Session code</span>
             <strong className="session-code">{activeSession}</strong>
+
             {role === "professor" && (
-              <button className="secondary-button" onClick={() => navigator.clipboard.writeText(activeSession)}>
+              <button
+                className="secondary-button"
+                onClick={() => navigator.clipboard.writeText(activeSession)}
+              >
                 Copy session code
               </button>
             )}
+
             <h3>Participants in this room</h3>
+
             {participants.length === 0 ? (
               <p className="muted">Waiting for the other participant...</p>
             ) : (
               <ul>
                 {participants.map((participant) => (
                   <li key={participant.socketId}>
-                    {participant.role === "professor" ? "Professor" : "Student"} connected
+                    {participant.role === "professor" ? "Professor" : "Student"}{" "}
+                    connected
                   </li>
                 ))}
               </ul>
@@ -634,16 +885,27 @@ export default function App() {
 
       <section className="panel camera-panel">
         <h2>Live camera</h2>
-        <p className="muted">The student shares video after joining a session.</p>
+        <p className="muted">
+          The student shares video after joining a session.
+        </p>
 
         {role === "student" && (
           <div className="action-area">
             {!localStream ? (
-              <button className="primary-button" onClick={startCamera}>Enable camera and microphone</button>
+              <button className="primary-button" onClick={startCamera}>
+                Enable camera and microphone
+              </button>
             ) : (
-              <button className="secondary-button" onClick={stopCamera}>Stop camera</button>
+              <button className="secondary-button" onClick={stopCamera}>
+                Stop camera
+              </button>
             )}
-            {cameraError && <p className="message" role="alert">{cameraError}</p>}
+
+            {cameraError && (
+              <p className="message" role="alert">
+                {cameraError}
+              </p>
+            )}
           </div>
         )}
 
@@ -662,53 +924,94 @@ export default function App() {
               >
                 {isDrawing ? "Stop drawing" : "Start drawing"}
               </button>
+
               <input
                 type="color"
                 value={selectedColor}
                 onChange={(event) => setSelectedColor(event.target.value)}
                 aria-label="Drawing color"
               />
-              <button type="button" onClick={clearAnnotations}>Clear drawings</button>
-              <button type="button" onClick={beginCaptureMode} disabled={!remoteStream}>
+
+              <button type="button" onClick={clearAnnotations}>
+                Clear drawings
+              </button>
+
+              <button
+                type="button"
+                onClick={beginCaptureMode}
+                disabled={!remoteStream}
+              >
                 Capture region
               </button>
+
               {isCapturing && (
                 <>
-                  <button type="button" onClick={saveSnapshot} disabled={!selectionRect}>
+                  <button
+                    type="button"
+                    onClick={saveSnapshot}
+                    disabled={!selectionRect}
+                  >
                     Save snapshot
                   </button>
-                  <button type="button" onClick={cancelCaptureMode}>Cancel</button>
+                  <button type="button" onClick={cancelCaptureMode}>
+                    Cancel
+                  </button>
                 </>
               )}
             </div>
-            {isCapturing && <p className="muted">Drag over the video to select the region you want to save.</p>}
+
+            {isCapturing && (
+              <p className="muted">
+                Drag over the video to select the region you want to save.
+              </p>
+            )}
           </div>
         )}
 
         <div className="video-grid">{renderVideo()}</div>
 
         {role === "student" && (
-          <p className="muted">The professor's annotations will appear over your camera view.</p>
+          <p className="muted">
+            The professor's annotations will appear over your camera view.
+          </p>
         )}
       </section>
 
-      {role === "professor" && (
+      {/* Shared workspace is visible to both professor and student. */}
+      {activeSession && (
         <section className="panel workspace-panel">
-          <h2>Captured regions workspace</h2>
-          <p className="muted">Snapshots captured from the student's live video appear here.</p>
+          <h2>Shared snapshots workspace</h2>
+          <p className="muted">
+            Snapshots captured by the professor are shared with participants
+            in this session.
+          </p>
+
           {snapshots.length === 0 ? (
-            <p className="muted">No regions captured yet. Click Capture region to get started.</p>
+            <p className="muted">No snapshots have been shared yet.</p>
           ) : (
             <div className="snapshot-grid">
               {snapshots.map((snapshot, index) => (
                 <article className="snapshot-card" key={snapshot.id}>
-                  <img src={snapshot.image} alt={`Captured region ${index + 1}`} />
+                  <img
+                    src={snapshot.image}
+                    alt={`Shared snapshot ${index + 1}`}
+                  />
                   <div className="snapshot-details">
-                    <strong>Region {snapshots.length - index}</strong>
-                    <span>{snapshot.width} × {snapshot.height}px · {snapshot.createdAt}</span>
-                    <button type="button" className="secondary-button" onClick={() => deleteSnapshot(snapshot.id)}>
-                      Remove
-                    </button>
+                    <strong>Snapshot {snapshots.length - index}</strong>
+                    <span>
+                      {snapshot.width} × {snapshot.height}px ·{" "}
+                      {snapshot.createdAt}
+                    </span>
+
+                    {role === "professor" && (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => deleteSnapshot(snapshot.id)}
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
                 </article>
               ))}
